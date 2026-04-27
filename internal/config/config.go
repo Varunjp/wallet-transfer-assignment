@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+
+	"github.com/joho/godotenv"
 )
 
 type Config struct {
@@ -28,6 +30,11 @@ func (d DBConfig) DSN() string {
 }
 
 func Load()(*Config,error) {
+
+	if err := godotenv.Load(); err != nil {
+		return nil,err 
+	}
+
 	port,err := strconv.Atoi(getEnv("DB_PORT",""))
 	if err != nil {
 		return nil,fmt.Errorf("invalid DB_PORT: %w",err)

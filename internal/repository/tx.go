@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -14,31 +15,40 @@ type TxManager struct {
 	db *pgxpool.Pool
 }
 
-func NewTxManger(db *pgxpool.Pool) *TxManager {
+var ErrNoTransaction = errors.New("transaction not found in context")
+
+func NewTxManager(db *pgxpool.Pool) *TxManager {
 	return &TxManager{db: db}
 }
 
-func (m *TxManager) WithTx(ctx context.Context,fn func(ctx context.Context)error) error {
-	tx,err := m.db.Begin(ctx)
+func NewTxManger(db *pgxpool.Pool) *TxManager {
+	return NewTxManager(db)
+}
+
+func (m *TxManager) WithTx(ctx context.Context, fn func(ctx context.Context) error) error {
+	tx, err := m.db.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w",err)
+		return fmt.Errorf("begin tx: %w", err)
 	}
 
-	txCtx := context.WithValue(ctx,txKey{},tx)
+	txCtx := context.WithValue(ctx, txKey{}, tx)
 
 	if err := fn(txCtx); err != nil {
 		_ = tx.Rollback(ctx)
-		return err 
+		return err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit tx: %w",err)
+		return fmt.Errorf("commit tx: %w", err)
 	}
 
-	return nil 
+	return nil
 }
 
-func getTx(ctx context.Context) pgx.Tx {
-	tx, _ := ctx.Value(txKey{}).(pgx.Tx)
-	return tx
+func getTx(ctx context.Context) (pgx.Tx, error) {
+	tx, ok := ctx.Value(txKey{}).(pgx.Tx)
+	if !ok || tx == nil {
+		return nil, ErrNoTransaction
+	}
+	return tx, nil
 }

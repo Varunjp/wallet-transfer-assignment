@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"wallet-service/internal/domain"
 
@@ -18,18 +19,27 @@ func NewTransferRepository(db *pgxpool.Pool) *TransferRepository {
 	return &TransferRepository{db: db}
 }
 
-func (r *TransferRepository) Create(ctx context.Context,t *domain.Transfer) error {
+func (r *TransferRepository) Create(ctx context.Context, t *domain.Transfer) error {
 	query := `
 		INSERT INTO transfers (id, idempotency_key, from_wallet_id, to_wallet_id, amount, status)
 		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING created_at, updated_at
 	`
-	_,err := r.db.Exec(ctx,query,t.ID,t.IdempotencyKey,
-	t.FromWalletID,t.ToWalletID,t.Amount,t.Status)
+	err := r.db.QueryRow(
+		ctx,
+		query,
+		t.ID,
+		t.IdempotencyKey,
+		t.FromWalletID,
+		t.ToWalletID,
+		t.Amount,
+		t.Status,
+	).Scan(&t.CreatedAt, &t.UpdatedAt)
 
-	return err 
+	return err
 }
 
-func (r *TransferRepository) UpdateStatus(ctx context.Context,id uuid.UUID,status domain.TransferStatus,reason *string) error {
+func (r *TransferRepository) UpdateStatus(ctx context.Context, id uuid.UUID, status domain.TransferStatus, reason *string) error {
 	_, err := r.db.Exec(ctx, `
 		UPDATE transfers
 		SET status = $1,
@@ -46,7 +56,10 @@ func (r *TransferRepository) Transition(
 	id uuid.UUID,
 	from, to domain.TransferStatus,
 ) error {
-	tx := getTx(ctx)
+	tx, err := getTx(ctx)
+	if err != nil {
+		return err
+	}
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE transfers
@@ -76,10 +89,10 @@ func (r *TransferRepository) FindByIdempotencyKey(ctx context.Context, key strin
 
 	t, err := scanTransfer(row)
 	if err != nil {
-		if err == pgx.ErrNoRows {
-			return nil,nil 
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
 		}
-		return nil,err 
+		return nil, err
 	}
 	return t, nil
 }

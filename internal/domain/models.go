@@ -21,38 +21,38 @@ const (
 var ErrInvalidTransition = errors.New("invalid state transition")
 
 type Transfer struct {
-	ID 				uuid.UUID
-	IdempotencyKey 	string 
-	FromWalletID 	uuid.UUID
-	ToWalletID 		uuid.UUID
-	Amount 			decimal.Decimal
-	Status 			TransferStatus
-	FailureReason   string 
-	CreatedAt		time.Time
-	UpdatedAt 		time.Time
+	ID             uuid.UUID
+	IdempotencyKey string
+	FromWalletID   uuid.UUID
+	ToWalletID     uuid.UUID
+	Amount         decimal.Decimal
+	Status         TransferStatus
+	FailureReason  *string
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 // Allowed transition enforced
 func (t *Transfer) CanTransitionTo(next TransferStatus) bool {
 	allowed := map[TransferStatus][]TransferStatus{
-		StatusPending: {StatusProcessed,StatusFailed},
+		StatusPending: {StatusProcessed, StatusFailed},
 	}
-	for _,s := range allowed[t.Status] {
+	for _, s := range allowed[t.Status] {
 		if s == next {
-			return true 
+			return true
 		}
 	}
-	return false 
+	return false
 }
 
-// --- Wallet 
+// --- Wallet
 
 type Wallet struct {
-	ID 		  uuid.UUID
-	OwnerID   string 
+	ID        uuid.UUID
+	OwnerID   string
 	Balance   decimal.Decimal
 	CreatedAt time.Time
-	UpdatedAt  time.Time
+	UpdatedAt time.Time
 }
 
 var ErrInsufficientFunds = errors.New("insufficient funds")
@@ -62,12 +62,12 @@ func (w *Wallet) ValidateDebit(amount decimal.Decimal) error {
 	if w.Balance.LessThan(amount) {
 		return ErrInsufficientFunds
 	}
-	return nil 
+	return nil
 }
 
 // --- LedgerEntry
 
-type EntryType string 
+type EntryType string
 
 const (
 	EntryDebit  EntryType = "DEBIT"
@@ -75,10 +75,10 @@ const (
 )
 
 type LedgerEntry struct {
-	ID 		 	uuid.UUID
-	WalletID 	uuid.UUID
-	TransferID 	uuid.UUID
-	Type 		EntryType
-	Amount 		decimal.Decimal
-	CreatedAt   time.Time
+	ID         uuid.UUID
+	WalletID   uuid.UUID
+	TransferID uuid.UUID
+	Type       EntryType
+	Amount     decimal.Decimal
+	CreatedAt  time.Time
 }

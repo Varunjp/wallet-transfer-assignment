@@ -28,7 +28,10 @@ func (r *WalletRepository) FindByID(ctx context.Context, id uuid.UUID) (*domain.
 }
 
 func (r *WalletRepository) LockByID(ctx context.Context, id uuid.UUID) (*domain.Wallet, error) {
-	tx := getTx(ctx)
+	tx, err := getTx(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	row := tx.QueryRow(ctx, `
 		SELECT id, owner_id, balance, created_at, updated_at
@@ -45,9 +48,12 @@ func (r *WalletRepository) ApplyDebitCredit(
 	fromID, toID uuid.UUID,
 	amount decimal.Decimal,
 ) error {
-	tx := getTx(ctx)
+	tx, err := getTx(ctx)
+	if err != nil {
+		return err
+	}
 
-	_, err := tx.Exec(ctx, `
+	_, err = tx.Exec(ctx, `
 		UPDATE wallets
 		SET balance = balance - $1, updated_at = NOW()
 		WHERE id = $2
@@ -66,10 +72,10 @@ func (r *WalletRepository) ApplyDebitCredit(
 }
 
 func scanWallet(row interface{ Scan(...any) error }) (*domain.Wallet, error) {
-    w := &domain.Wallet{}
-    err := row.Scan(&w.ID, &w.OwnerID, &w.Balance, &w.CreatedAt, &w.UpdatedAt)
-    if err != nil {
-        return nil, fmt.Errorf("scan wallet: %w", err)
-    }
-    return w, nil
+	w := &domain.Wallet{}
+	err := row.Scan(&w.ID, &w.OwnerID, &w.Balance, &w.CreatedAt, &w.UpdatedAt)
+	if err != nil {
+		return nil, fmt.Errorf("scan wallet: %w", err)
+	}
+	return w, nil
 }

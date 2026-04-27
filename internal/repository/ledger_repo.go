@@ -15,7 +15,10 @@ func NewLedgerRepository() *LedgerRepository {
 }
 
 func (r *LedgerRepository) BulkInsert(ctx context.Context, entries []domain.LedgerEntry) error {
-	tx := getTx(ctx)
+	tx, err := getTx(ctx)
+	if err != nil {
+		return err
+	}
 
 	if len(entries) != 2 {
 		return fmt.Errorf("ledger must have 2 entries")
@@ -26,7 +29,7 @@ func (r *LedgerRepository) BulkInsert(ctx context.Context, entries []domain.Ledg
 		rows[i] = []any{e.ID, e.WalletID, e.TransferID, string(e.Type), e.Amount}
 	}
 
-	_, err := tx.CopyFrom(
+	_, err = tx.CopyFrom(
 		ctx,
 		pgx.Identifier{"ledger_entries"},
 		[]string{"id", "wallet_id", "transfer_id", "type", "amount"},
