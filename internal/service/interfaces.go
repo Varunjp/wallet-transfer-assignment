@@ -11,6 +11,7 @@ import (
 type TransferRepository interface {
 	Create(ctx context.Context, t *domain.Transfer) error
 	FindByIdempotencyKey(ctx context.Context, key string) (*domain.Transfer, error)
+	LockByID(ctx context.Context, id uuid.UUID) (*domain.Transfer, error)
 	UpdateStatus(ctx context.Context, id uuid.UUID, status domain.TransferStatus, reason *string) error
 	Transition(ctx context.Context, id uuid.UUID, from, to domain.TransferStatus) error
 }

@@ -65,7 +65,6 @@ var (
 	ErrWalletNotFound       = errors.New("wallet not found")
 	ErrIdempotencyConflict  = errors.New("idempotency key conflicts with existing transfer")
 	ErrTransferStillPending = errors.New("transfer is still pending")
-	ErrSameWallet           = errors.New("cannot transfer to the same wallet")
 )
 
 type TransferService struct {
@@ -110,7 +109,7 @@ func (s *TransferService) CreateTransfer(ctx context.Context, req CreateTransfer
 			return nil, err
 		}
 		if existing.Status == domain.StatusPending {
-			return nil, ErrTransferStillPending
+			return s.processPendingTransfer(ctx, existing, req, true)
 		}
 		s.log.Info("idempotent request hit",
 			"key", req.IdempotencyKey,
@@ -139,9 +138,8 @@ func (s *TransferService) CreateTransfer(ctx context.Context, req CreateTransfer
 			if existing == nil {
 				return nil, fmt.Errorf("transfer already exists but could not be found")
 			}
-			existing, err = s.waitForExistingTransferToSettle(ctx, req, existing)
-			if err != nil {
-				return nil, err
+			if existing.Status == domain.StatusPending {
+				return s.processPendingTransfer(ctx, existing, req, true)
 			}
 			return toResponse(existing, true), nil
 		}
@@ -158,18 +156,44 @@ func (s *TransferService) CreateTransfer(ctx context.Context, req CreateTransfer
 		"amount", req.Amount,
 	)
 
-	err = s.txManager.WithTx(ctx, func(txCtx context.Context) error {
+	return s.processPendingTransfer(ctx, transfer, req, false)
+}
+
+func (s *TransferService) processPendingTransfer(
+	ctx context.Context,
+	transfer *domain.Transfer,
+	req CreateTransferRequest,
+	replayed bool,
+) (*TransferResponse, error) {
+	var finalTransfer *domain.Transfer
+	var committedFailure error
+
+	err := s.txManager.WithTx(ctx, func(txCtx context.Context) error {
+		lockedTransfer, err := s.transferRepo.LockByID(txCtx, transfer.ID)
+		if err != nil {
+			return err
+		}
+		if err := ensureIdempotentReplayMatches(lockedTransfer, req); err != nil {
+			return err
+		}
+		if lockedTransfer.Status != domain.StatusPending {
+			finalTransfer = lockedTransfer
+			return nil
+		}
+
 		s.log.Debug("starting transfer transaction",
-			"transferID", transfer.ID,
+			"transferID", lockedTransfer.ID,
 		)
 
 		fromWallet, toWallet, err := s.lockTransferWallets(txCtx, req.FromWalletID, req.ToWalletID)
 		if err != nil {
-			return err
+			committedFailure = err
+			return s.markTransferFailed(txCtx, lockedTransfer, err)
 		}
 
 		if err := fromWallet.ValidateDebit(req.Amount); err != nil {
-			return err
+			committedFailure = err
+			return s.markTransferFailed(txCtx, lockedTransfer, err)
 		}
 
 		err = s.walletRepo.ApplyDebitCredit(
@@ -186,14 +210,14 @@ func (s *TransferService) CreateTransfer(ctx context.Context, req CreateTransfer
 			{
 				ID:         uuid.New(),
 				WalletID:   fromWallet.ID,
-				TransferID: transfer.ID,
+				TransferID: lockedTransfer.ID,
 				Type:       domain.EntryDebit,
 				Amount:     req.Amount,
 			},
 			{
 				ID:         uuid.New(),
 				WalletID:   toWallet.ID,
-				TransferID: transfer.ID,
+				TransferID: lockedTransfer.ID,
 				Type:       domain.EntryCredit,
 				Amount:     req.Amount,
 			},
@@ -203,13 +227,30 @@ func (s *TransferService) CreateTransfer(ctx context.Context, req CreateTransfer
 			return err
 		}
 
-		return s.transferRepo.Transition(
+		if err := s.transferRepo.Transition(
 			txCtx,
-			transfer.ID,
+			lockedTransfer.ID,
 			domain.StatusPending,
 			domain.StatusProcessed,
-		)
+		); err != nil {
+			return err
+		}
+
+		lockedTransfer.Status = domain.StatusProcessed
+		finalTransfer = lockedTransfer
+		return nil
 	})
+
+	if committedFailure != nil {
+		if errors.Is(committedFailure, repository.ErrWalletNotFound) {
+			committedFailure = ErrWalletNotFound
+		}
+		s.log.Error("transfer failed",
+			"transferID", transfer.ID,
+			"error", committedFailure,
+		)
+		return nil, committedFailure
+	}
 
 	if err != nil {
 		if errors.Is(err, repository.ErrWalletNotFound) {
@@ -229,12 +270,28 @@ func (s *TransferService) CreateTransfer(ctx context.Context, req CreateTransfer
 		return nil, err
 	}
 
-	transfer.Status = domain.StatusProcessed
+	if finalTransfer == nil {
+		finalTransfer = transfer
+	}
 	s.log.Info("transfer completed",
-		"transferID", transfer.ID,
-		"status", "PROCESSED",
+		"transferID", finalTransfer.ID,
+		"status", finalTransfer.Status,
 	)
-	return toResponse(transfer, false), nil
+	return toResponse(finalTransfer, replayed), nil
+}
+
+func (s *TransferService) markTransferFailed(ctx context.Context, transfer *domain.Transfer, cause error) error {
+	statusErr := cause
+	if errors.Is(statusErr, repository.ErrWalletNotFound) {
+		statusErr = ErrWalletNotFound
+	}
+	reason := statusErr.Error()
+	if err := s.transferRepo.UpdateStatus(ctx, transfer.ID, domain.StatusFailed, &reason); err != nil {
+		return err
+	}
+	transfer.Status = domain.StatusFailed
+	transfer.FailureReason = &reason
+	return nil
 }
 
 func (s *TransferService) lockTransferWallets(ctx context.Context, fromID, toID uuid.UUID) (*domain.Wallet, *domain.Wallet, error) {
@@ -301,46 +358,6 @@ func validateAmountFitsSchema(amount decimal.Decimal) error {
 	}
 
 	return nil
-}
-
-func (s *TransferService) waitForExistingTransferToSettle(
-	ctx context.Context,
-	req CreateTransferRequest,
-	existing *domain.Transfer,
-) (*domain.Transfer, error) {
-	const attempts = 10
-	const delay = 10 * time.Millisecond
-
-	for i := 0; i < attempts; i++ {
-		if err := ensureIdempotentReplayMatches(existing, req); err != nil {
-			return nil, err
-		}
-		if existing.Status != domain.StatusPending {
-			return existing, nil
-		}
-
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, ctx.Err()
-		case <-timer.C:
-		}
-
-		var err error
-		existing, err = s.transferRepo.FindByIdempotencyKey(ctx, req.IdempotencyKey)
-		if err != nil {
-			return nil, fmt.Errorf("find existing transfer while waiting for pending transfer: %w", err)
-		}
-		if existing == nil {
-			return nil, fmt.Errorf("transfer already exists but could not be found")
-		}
-	}
-
-	if err := ensureIdempotentReplayMatches(existing, req); err != nil {
-		return nil, err
-	}
-	return nil, ErrTransferStillPending
 }
 
 func toResponse(t *domain.Transfer, replayed bool) *TransferResponse {

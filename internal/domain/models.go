@@ -32,18 +32,6 @@ type Transfer struct {
 	UpdatedAt      time.Time
 }
 
-// Allowed transition enforced
-func (t *Transfer) CanTransitionTo(next TransferStatus) bool {
-	allowed := map[TransferStatus][]TransferStatus{
-		StatusPending: {StatusProcessed, StatusFailed},
-	}
-	for _, s := range allowed[t.Status] {
-		if s == next {
-			return true
-		}
-	}
-	return false
-}
 
 // --- Wallet
 

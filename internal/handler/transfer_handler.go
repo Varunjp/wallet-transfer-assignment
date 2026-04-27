@@ -1,9 +1,10 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
-	"log"
 	"net/http"
+	"strings"
 	"wallet-service/internal/domain"
 	"wallet-service/internal/service"
 
@@ -21,10 +22,10 @@ func NewTransferHandler(s *service.TransferService) *TransferHandler {
 }
 
 type createTransferRequest struct {
-	IdempotencyKey string `json:"idempotencyKey"`
-	FromWalletID   string `json:"fromWalletId" binding:"required,uuid"`
-	ToWalletID     string `json:"toWalletId" binding:"required,uuid"`
-	Amount         string `json:"amount" binding:"required"`
+	IdempotencyKey string          `json:"idempotencyKey"`
+	FromWalletID   string          `json:"fromWalletId" binding:"required,uuid"`
+	ToWalletID     string          `json:"toWalletId" binding:"required,uuid"`
+	Amount         json.RawMessage `json:"amount" binding:"required"`
 }
 
 type TransferResponse struct {
@@ -43,7 +44,6 @@ func (h *TransferHandler) CreateTransfer(c *gin.Context) {
 	var req createTransferRequest
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		log.Println("check err :", err)
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "invalid request body",
 		})
@@ -74,7 +74,7 @@ func (h *TransferHandler) CreateTransfer(c *gin.Context) {
 		return
 	}
 
-	amount, err := decimal.NewFromString(req.Amount)
+	amount, err := parseTransferAmount(req.Amount)
 	if err != nil || amount.LessThanOrEqual(decimal.Zero) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid amount"})
 		return
@@ -111,4 +111,18 @@ func (h *TransferHandler) CreateTransfer(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, transfer)
+}
+
+func parseTransferAmount(raw json.RawMessage) (decimal.Decimal, error) {
+	value := strings.TrimSpace(string(raw))
+	if value == "" || value == "null" {
+		return decimal.Zero, errors.New("amount required")
+	}
+
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		value = strings.TrimSpace(text)
+	}
+
+	return decimal.NewFromString(value)
 }

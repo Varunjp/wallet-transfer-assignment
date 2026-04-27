@@ -40,6 +40,18 @@ func (r *TransferRepository) Create(ctx context.Context, t *domain.Transfer) err
 }
 
 func (r *TransferRepository) UpdateStatus(ctx context.Context, id uuid.UUID, status domain.TransferStatus, reason *string) error {
+	if tx, err := getTx(ctx); err == nil {
+		_, err := tx.Exec(ctx, `
+			UPDATE transfers
+			SET status = $1,
+			    failure_reason = $2,
+			    updated_at = NOW()
+			WHERE id = $3
+		`, status, reason, id)
+
+		return err
+	}
+
 	_, err := r.db.Exec(ctx, `
 		UPDATE transfers
 		SET status = $1,
@@ -49,6 +61,30 @@ func (r *TransferRepository) UpdateStatus(ctx context.Context, id uuid.UUID, sta
 	`, status, reason, id)
 
 	return err
+}
+
+func (r *TransferRepository) LockByID(ctx context.Context, id uuid.UUID) (*domain.Transfer, error) {
+	tx, err := getTx(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	row := tx.QueryRow(ctx, `
+		SELECT id,idempotency_key,from_wallet_id, to_wallet_id,
+		       amount, status, failure_reason, created_at, updated_at
+		FROM transfers
+		WHERE id = $1
+		FOR UPDATE
+	`, id)
+
+	t, err := scanTransfer(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("transfer not found")
+		}
+		return nil, err
+	}
+	return t, nil
 }
 
 func (r *TransferRepository) Transition(

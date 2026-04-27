@@ -151,7 +151,7 @@ func TestCreateTransferRejectsIdempotencyKeyWithDifferentPayload(t *testing.T) {
 	}
 }
 
-func TestCreateTransferRejectsPendingIdempotencyReplay(t *testing.T) {
+func TestCreateTransferResumesPendingIdempotencyReplay(t *testing.T) {
 	fromID := uuid.New()
 	toID := uuid.New()
 	existing := &domain.Transfer{
@@ -164,7 +164,14 @@ func TestCreateTransferRejectsPendingIdempotencyReplay(t *testing.T) {
 	}
 	transferRepo := &fakeTransferRepo{existing: existing}
 	txManager := &fakeTxManager{}
-	svc := newTestTransferService(txManager, transferRepo, &fakeWalletRepo{}, &fakeLedgerRepo{})
+	walletRepo := &fakeWalletRepo{
+		wallets: map[uuid.UUID]*domain.Wallet{
+			fromID: {ID: fromID, Balance: decimal.NewFromInt(50)},
+			toID:   {ID: toID, Balance: decimal.NewFromInt(10)},
+		},
+	}
+	ledgerRepo := &fakeLedgerRepo{}
+	svc := newTestTransferService(txManager, transferRepo, walletRepo, ledgerRepo)
 
 	resp, err := svc.CreateTransfer(context.Background(), service.CreateTransferRequest{
 		IdempotencyKey: "pending-key",
@@ -173,15 +180,15 @@ func TestCreateTransferRejectsPendingIdempotencyReplay(t *testing.T) {
 		Amount:         decimal.NewFromInt(25),
 	})
 
-	if resp != nil {
-		t.Fatalf("expected nil response, got %#v", resp)
+	if err != nil {
+		t.Fatalf("expected pending transfer to be resumed, got %v", err)
 	}
-	if !errors.Is(err, service.ErrTransferStillPending) {
-		t.Fatalf("expected pending transfer error, got %v", err)
+	if resp == nil || !resp.Replayed || resp.Status != domain.StatusProcessed {
+		t.Fatalf("expected replayed processed response, got %#v", resp)
 	}
-	if transferRepo.createCalls != 0 || txManager.calls != 0 {
-		t.Fatalf("pending replay should skip create and tx, got create=%d tx=%d",
-			transferRepo.createCalls, txManager.calls)
+	if transferRepo.createCalls != 0 || txManager.calls != 1 || walletRepo.applyCalls != 1 || len(ledgerRepo.entries) != 2 {
+		t.Fatalf("pending replay should process once, create=%d tx=%d apply=%d ledger=%d",
+			transferRepo.createCalls, txManager.calls, walletRepo.applyCalls, len(ledgerRepo.entries))
 	}
 }
 
@@ -472,6 +479,67 @@ func TestCreateTransferConcurrentRequestsWithSameIdempotencyKey(t *testing.T) {
 	}
 }
 
+func TestCreateTransferConcurrentDifferentTransfersDoNotOverspend(t *testing.T) {
+	fromID := uuid.New()
+	toID1 := uuid.New()
+	toID2 := uuid.New()
+	amount := decimal.NewFromInt(10)
+	transferRepo := newConcurrentTransferRepo(2)
+	txManager := &concurrentTxManager{}
+	walletRepo := newConcurrentWalletRepo(map[uuid.UUID]*domain.Wallet{
+		fromID: {ID: fromID, Balance: decimal.NewFromInt(15)},
+		toID1:  {ID: toID1, Balance: decimal.Zero},
+		toID2:  {ID: toID2, Balance: decimal.Zero},
+	})
+	ledgerRepo := &concurrentLedgerRepo{}
+	svc := newTestTransferService(txManager, transferRepo, walletRepo, ledgerRepo)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errorsCh := make(chan error, 2)
+
+	for _, req := range []service.CreateTransferRequest{
+		{IdempotencyKey: "debit-race-1", FromWalletID: fromID, ToWalletID: toID1, Amount: amount},
+		{IdempotencyKey: "debit-race-2", FromWalletID: fromID, ToWalletID: toID2, Amount: amount},
+	} {
+		wg.Add(1)
+		go func(req service.CreateTransferRequest) {
+			defer wg.Done()
+			<-start
+			_, err := svc.CreateTransfer(context.Background(), req)
+			errorsCh <- err
+		}(req)
+	}
+
+	close(start)
+	wg.Wait()
+	close(errorsCh)
+
+	successes := 0
+	insufficientFunds := 0
+	for err := range errorsCh {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, domain.ErrInsufficientFunds):
+			insufficientFunds++
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	if successes != 1 || insufficientFunds != 1 {
+		t.Fatalf("expected one success and one insufficient-funds failure, got success=%d insufficient=%d",
+			successes, insufficientFunds)
+	}
+	if walletRepo.applyCallCount() != 1 {
+		t.Fatalf("expected only one debit/credit operation, got %d", walletRepo.applyCallCount())
+	}
+	if ledgerRepo.insertCallCount() != 1 {
+		t.Fatalf("expected only one ledger insert, got %d", ledgerRepo.insertCallCount())
+	}
+}
+
 func TestCreateTransferMarksFailedWhenLedgerInsertFails(t *testing.T) {
 	fromID := uuid.New()
 	toID := uuid.New()
@@ -577,6 +645,19 @@ func (r *fakeTransferRepo) Create(_ context.Context, tr *domain.Transfer) error 
 	return nil
 }
 
+func (r *fakeTransferRepo) LockByID(_ context.Context, id uuid.UUID) (*domain.Transfer, error) {
+	if r.created != nil && r.created.ID == id {
+		return r.created, nil
+	}
+	if r.existing != nil && r.existing.ID == id {
+		return r.existing, nil
+	}
+	if r.existingAfterCreateErr != nil && r.existingAfterCreateErr.ID == id {
+		return r.existingAfterCreateErr, nil
+	}
+	return nil, errors.New("transfer not found")
+}
+
 func (r *fakeTransferRepo) UpdateStatus(_ context.Context, _ uuid.UUID, status domain.TransferStatus, reason *string) error {
 	r.updateStatusCalls++
 	r.updatedStatus = status
@@ -588,6 +669,12 @@ func (r *fakeTransferRepo) Transition(_ context.Context, _ uuid.UUID, from, to d
 	r.transitionCalls++
 	r.transitionFrom = from
 	r.transitionTo = to
+	if r.created != nil && r.created.Status == from {
+		r.created.Status = to
+	}
+	if r.existing != nil && r.existing.Status == from {
+		r.existing.Status = to
+	}
 	return r.transitionErr
 }
 
@@ -640,7 +727,7 @@ type concurrentTxManager struct {
 func (m *concurrentTxManager) WithTx(ctx context.Context, fn func(context.Context) error) error {
 	m.mu.Lock()
 	m.calls++
-	m.mu.Unlock()
+	defer m.mu.Unlock()
 	return fn(ctx)
 }
 
@@ -701,6 +788,17 @@ func (r *concurrentTransferRepo) Create(_ context.Context, tr *domain.Transfer) 
 
 func (r *concurrentTransferRepo) UpdateStatus(context.Context, uuid.UUID, domain.TransferStatus, *string) error {
 	return nil
+}
+
+func (r *concurrentTransferRepo) LockByID(_ context.Context, id uuid.UUID) (*domain.Transfer, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, tr := range r.byKey {
+		if tr.ID == id {
+			return tr, nil
+		}
+	}
+	return nil, errors.New("transfer not found")
 }
 
 func (r *concurrentTransferRepo) Transition(_ context.Context, id uuid.UUID, from, to domain.TransferStatus) error {
