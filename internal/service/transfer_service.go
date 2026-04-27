@@ -39,6 +39,9 @@ func (i CreateTransferRequest) validate() error {
 	if i.Amount.LessThanOrEqual(decimal.Zero) {
 		return fmt.Errorf("amount must be greater than zero")
 	}
+	if err := validateAmountFitsSchema(i.Amount); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -58,9 +61,11 @@ type TransferResponse struct {
 // without importing the domain or repository packages.
 
 var (
-	ErrInvalidInput   = errors.New("invalid input")
-	ErrWalletNotFound = errors.New("wallet not found")
-	ErrSameWallet     = errors.New("cannot transfer to the same wallet")
+	ErrInvalidInput         = errors.New("invalid input")
+	ErrWalletNotFound       = errors.New("wallet not found")
+	ErrIdempotencyConflict  = errors.New("idempotency key conflicts with existing transfer")
+	ErrTransferStillPending = errors.New("transfer is still pending")
+	ErrSameWallet           = errors.New("cannot transfer to the same wallet")
 )
 
 type TransferService struct {
@@ -101,6 +106,12 @@ func (s *TransferService) CreateTransfer(ctx context.Context, req CreateTransfer
 	}
 
 	if existing != nil {
+		if err := ensureIdempotentReplayMatches(existing, req); err != nil {
+			return nil, err
+		}
+		if existing.Status == domain.StatusPending {
+			return nil, ErrTransferStillPending
+		}
 		s.log.Info("idempotent request hit",
 			"key", req.IdempotencyKey,
 			"transfer_id", existing.ID,
@@ -128,7 +139,14 @@ func (s *TransferService) CreateTransfer(ctx context.Context, req CreateTransfer
 			if existing == nil {
 				return nil, fmt.Errorf("transfer already exists but could not be found")
 			}
+			existing, err = s.waitForExistingTransferToSettle(ctx, req, existing)
+			if err != nil {
+				return nil, err
+			}
 			return toResponse(existing, true), nil
+		}
+		if repository.IsForeignKeyViolation(err) {
+			return nil, ErrWalletNotFound
 		}
 		return nil, err
 	}
@@ -194,6 +212,9 @@ func (s *TransferService) CreateTransfer(ctx context.Context, req CreateTransfer
 	})
 
 	if err != nil {
+		if errors.Is(err, repository.ErrWalletNotFound) {
+			err = ErrWalletNotFound
+		}
 		reason := err.Error()
 		_ = s.transferRepo.UpdateStatus(
 			ctx,
@@ -224,11 +245,17 @@ func (s *TransferService) lockTransferWallets(ctx context.Context, fromID, toID 
 
 	firstWallet, err := s.walletRepo.LockByID(ctx, firstID)
 	if err != nil {
+		if errors.Is(err, repository.ErrWalletNotFound) {
+			return nil, nil, ErrWalletNotFound
+		}
 		return nil, nil, err
 	}
 
 	secondWallet, err := s.walletRepo.LockByID(ctx, secondID)
 	if err != nil {
+		if errors.Is(err, repository.ErrWalletNotFound) {
+			return nil, nil, ErrWalletNotFound
+		}
 		return nil, nil, err
 	}
 
@@ -236,6 +263,84 @@ func (s *TransferService) lockTransferWallets(ctx context.Context, fromID, toID 
 		return firstWallet, secondWallet, nil
 	}
 	return secondWallet, firstWallet, nil
+}
+
+func ensureIdempotentReplayMatches(existing *domain.Transfer, req CreateTransferRequest) error {
+	if existing.FromWalletID != req.FromWalletID ||
+		existing.ToWalletID != req.ToWalletID ||
+		!existing.Amount.Equal(req.Amount) {
+		return ErrIdempotencyConflict
+	}
+	return nil
+}
+
+func validateAmountFitsSchema(amount decimal.Decimal) error {
+	const maxScale = 8
+	const maxIntegerDigits = 12
+
+	scale := int32(0)
+	if amount.Exponent() < 0 {
+		scale = -amount.Exponent()
+	}
+	if scale > maxScale {
+		return fmt.Errorf("amount supports at most %d decimal places", maxScale)
+	}
+
+	coefficientDigits := len(amount.Abs().Coefficient().String())
+	integerDigits := coefficientDigits
+	if scale > 0 {
+		integerDigits -= int(scale)
+		if integerDigits < 0 {
+			integerDigits = 0
+		}
+	} else if amount.Exponent() > 0 {
+		integerDigits += int(amount.Exponent())
+	}
+	if integerDigits > maxIntegerDigits {
+		return fmt.Errorf("amount supports at most %d digits before decimal point", maxIntegerDigits)
+	}
+
+	return nil
+}
+
+func (s *TransferService) waitForExistingTransferToSettle(
+	ctx context.Context,
+	req CreateTransferRequest,
+	existing *domain.Transfer,
+) (*domain.Transfer, error) {
+	const attempts = 10
+	const delay = 10 * time.Millisecond
+
+	for i := 0; i < attempts; i++ {
+		if err := ensureIdempotentReplayMatches(existing, req); err != nil {
+			return nil, err
+		}
+		if existing.Status != domain.StatusPending {
+			return existing, nil
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+
+		var err error
+		existing, err = s.transferRepo.FindByIdempotencyKey(ctx, req.IdempotencyKey)
+		if err != nil {
+			return nil, fmt.Errorf("find existing transfer while waiting for pending transfer: %w", err)
+		}
+		if existing == nil {
+			return nil, fmt.Errorf("transfer already exists but could not be found")
+		}
+	}
+
+	if err := ensureIdempotentReplayMatches(existing, req); err != nil {
+		return nil, err
+	}
+	return nil, ErrTransferStillPending
 }
 
 func toResponse(t *domain.Transfer, replayed bool) *TransferResponse {

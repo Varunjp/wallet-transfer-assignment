@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"errors"
 	"log"
 	"net/http"
 	"wallet-service/internal/domain"
@@ -27,14 +28,14 @@ type createTransferRequest struct {
 }
 
 type TransferResponse struct {
-	ID             string `json:"id"`
-	IdempotencyKey string `json:"idempotencyKey"`
-	FromWalletID   string `json:"fromWalletId"`
-	ToWalletID     string `json:"toWalletId"`
-	Amount         string `json:"amount"`
-	Status         string `json:"status"`
+	ID             string  `json:"id"`
+	IdempotencyKey string  `json:"idempotencyKey"`
+	FromWalletID   string  `json:"fromWalletId"`
+	ToWalletID     string  `json:"toWalletId"`
+	Amount         string  `json:"amount"`
+	Status         string  `json:"status"`
 	FailureReason  *string `json:"failureReason,omitempty"`
-	CreatedAt      string `json:"createdAt"`
+	CreatedAt      string  `json:"createdAt"`
 }
 
 func (h *TransferHandler) CreateTransfer(c *gin.Context) {
@@ -42,11 +43,11 @@ func (h *TransferHandler) CreateTransfer(c *gin.Context) {
 	var req createTransferRequest
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		log.Println("check err :",err)
-		c.JSON(http.StatusBadRequest,gin.H{
+		log.Println("check err :", err)
+		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "invalid request body",
 		})
-		return 
+		return
 	}
 
 	idempotencyKey := c.GetHeader("Idempotency-Key")
@@ -55,10 +56,10 @@ func (h *TransferHandler) CreateTransfer(c *gin.Context) {
 	}
 
 	if idempotencyKey == "" {
-		c.JSON(http.StatusBadRequest,gin.H{
+		c.JSON(http.StatusBadRequest, gin.H{
 			"error": "idempotency key required",
 		})
-		return 
+		return
 	}
 
 	fromID, err := uuid.Parse(req.FromWalletID)
@@ -79,23 +80,35 @@ func (h *TransferHandler) CreateTransfer(c *gin.Context) {
 		return
 	}
 
-	transfer,err := h.service.CreateTransfer(c.Request.Context(),service.CreateTransferRequest{
+	transfer, err := h.service.CreateTransfer(c.Request.Context(), service.CreateTransferRequest{
 		IdempotencyKey: idempotencyKey,
-		FromWalletID: fromID,
-		ToWalletID: toID,
-		Amount: amount,
+		FromWalletID:   fromID,
+		ToWalletID:     toID,
+		Amount:         amount,
 	})
 
 	if err != nil {
-		if err == domain.ErrInsufficientFunds {
-			c.JSON(http.StatusBadRequest,gin.H{"error": err.Error()})
-			return 
+		if errors.Is(err, service.ErrInvalidInput) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
 		}
-		c.JSON(http.StatusInternalServerError,gin.H{
-			"error":"failed to process transfer",
+		if errors.Is(err, domain.ErrInsufficientFunds) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, service.ErrWalletNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, service.ErrIdempotencyConflict) || errors.Is(err, service.ErrTransferStillPending) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "failed to process transfer",
 		})
-		return 
+		return
 	}
 
-	c.JSON(http.StatusOK,transfer)
+	c.JSON(http.StatusOK, transfer)
 }

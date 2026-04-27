@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 	"wallet-service/internal/domain"
+	"wallet-service/internal/repository"
 	"wallet-service/internal/service"
 
 	"github.com/google/uuid"
@@ -75,6 +76,24 @@ func TestCreateTransferValidationErrors(t *testing.T) {
 				Amount:         decimal.NewFromInt(-1),
 			},
 		},
+		{
+			name: "too many decimal places",
+			req: service.CreateTransferRequest{
+				IdempotencyKey: "key-1",
+				FromWalletID:   fromID,
+				ToWalletID:     toID,
+				Amount:         decimal.RequireFromString("1.123456789"),
+			},
+		},
+		{
+			name: "too many integer digits",
+			req: service.CreateTransferRequest{
+				IdempotencyKey: "key-1",
+				FromWalletID:   fromID,
+				ToWalletID:     toID,
+				Amount:         decimal.RequireFromString("1000000000000"),
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -95,6 +114,74 @@ func TestCreateTransferValidationErrors(t *testing.T) {
 					transferRepo.findCalls, transferRepo.createCalls, txManager.calls)
 			}
 		})
+	}
+}
+
+func TestCreateTransferRejectsIdempotencyKeyWithDifferentPayload(t *testing.T) {
+	fromID := uuid.New()
+	toID := uuid.New()
+	existing := &domain.Transfer{
+		ID:             uuid.New(),
+		IdempotencyKey: "repeat-key",
+		FromWalletID:   fromID,
+		ToWalletID:     toID,
+		Amount:         decimal.NewFromInt(25),
+		Status:         domain.StatusProcessed,
+	}
+	transferRepo := &fakeTransferRepo{existing: existing}
+	txManager := &fakeTxManager{}
+	svc := newTestTransferService(txManager, transferRepo, &fakeWalletRepo{}, &fakeLedgerRepo{})
+
+	resp, err := svc.CreateTransfer(context.Background(), service.CreateTransferRequest{
+		IdempotencyKey: "repeat-key",
+		FromWalletID:   fromID,
+		ToWalletID:     toID,
+		Amount:         decimal.NewFromInt(30),
+	})
+
+	if resp != nil {
+		t.Fatalf("expected nil response, got %#v", resp)
+	}
+	if !errors.Is(err, service.ErrIdempotencyConflict) {
+		t.Fatalf("expected idempotency conflict, got %v", err)
+	}
+	if transferRepo.createCalls != 0 || txManager.calls != 0 {
+		t.Fatalf("conflicting replay should skip create and tx, got create=%d tx=%d",
+			transferRepo.createCalls, txManager.calls)
+	}
+}
+
+func TestCreateTransferRejectsPendingIdempotencyReplay(t *testing.T) {
+	fromID := uuid.New()
+	toID := uuid.New()
+	existing := &domain.Transfer{
+		ID:             uuid.New(),
+		IdempotencyKey: "pending-key",
+		FromWalletID:   fromID,
+		ToWalletID:     toID,
+		Amount:         decimal.NewFromInt(25),
+		Status:         domain.StatusPending,
+	}
+	transferRepo := &fakeTransferRepo{existing: existing}
+	txManager := &fakeTxManager{}
+	svc := newTestTransferService(txManager, transferRepo, &fakeWalletRepo{}, &fakeLedgerRepo{})
+
+	resp, err := svc.CreateTransfer(context.Background(), service.CreateTransferRequest{
+		IdempotencyKey: "pending-key",
+		FromWalletID:   fromID,
+		ToWalletID:     toID,
+		Amount:         decimal.NewFromInt(25),
+	})
+
+	if resp != nil {
+		t.Fatalf("expected nil response, got %#v", resp)
+	}
+	if !errors.Is(err, service.ErrTransferStillPending) {
+		t.Fatalf("expected pending transfer error, got %v", err)
+	}
+	if transferRepo.createCalls != 0 || txManager.calls != 0 {
+		t.Fatalf("pending replay should skip create and tx, got create=%d tx=%d",
+			transferRepo.createCalls, txManager.calls)
 	}
 }
 
@@ -225,6 +312,41 @@ func TestCreateTransferMarksTransferFailedWhenFundsAreInsufficient(t *testing.T)
 	}
 	if walletRepo.applyCalls != 0 || len(ledgerRepo.entries) != 0 || transferRepo.transitionCalls != 0 {
 		t.Fatalf("failed debit should skip apply, ledger, and transition")
+	}
+}
+
+func TestCreateTransferMarksFailedWhenWalletIsMissing(t *testing.T) {
+	fromID := uuid.New()
+	toID := uuid.New()
+	transferRepo := &fakeTransferRepo{}
+	txManager := &fakeTxManager{}
+	walletRepo := &fakeWalletRepo{
+		wallets: map[uuid.UUID]*domain.Wallet{
+			fromID: {ID: fromID, Balance: decimal.NewFromInt(100)},
+		},
+	}
+	ledgerRepo := &fakeLedgerRepo{}
+	svc := newTestTransferService(txManager, transferRepo, walletRepo, ledgerRepo)
+
+	resp, err := svc.CreateTransfer(context.Background(), service.CreateTransferRequest{
+		IdempotencyKey: "key-missing-wallet",
+		FromWalletID:   fromID,
+		ToWalletID:     toID,
+		Amount:         decimal.NewFromInt(50),
+	})
+
+	if resp != nil {
+		t.Fatalf("expected nil response, got %#v", resp)
+	}
+	if !errors.Is(err, service.ErrWalletNotFound) {
+		t.Fatalf("expected wallet not found, got %v", err)
+	}
+	if transferRepo.updateStatusCalls != 1 || transferRepo.updatedStatus != domain.StatusFailed {
+		t.Fatalf("expected transfer to be marked failed, calls=%d status=%s",
+			transferRepo.updateStatusCalls, transferRepo.updatedStatus)
+	}
+	if walletRepo.applyCalls != 0 || len(ledgerRepo.entries) != 0 || transferRepo.transitionCalls != 0 {
+		t.Fatalf("missing wallet should skip apply, ledger, and transition")
 	}
 }
 
@@ -487,7 +609,7 @@ func (r *fakeWalletRepo) LockByID(_ context.Context, id uuid.UUID) (*domain.Wall
 	}
 	wallet, ok := r.wallets[id]
 	if !ok {
-		return nil, errors.New("wallet not found")
+		return nil, repository.ErrWalletNotFound
 	}
 	return wallet, nil
 }

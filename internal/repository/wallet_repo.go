@@ -2,10 +2,12 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"wallet-service/internal/domain"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
 )
@@ -53,7 +55,7 @@ func (r *WalletRepository) ApplyDebitCredit(
 		return err
 	}
 
-	_, err = tx.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 		UPDATE wallets
 		SET balance = balance - $1, updated_at = NOW()
 		WHERE id = $2
@@ -61,20 +63,32 @@ func (r *WalletRepository) ApplyDebitCredit(
 	if err != nil {
 		return err
 	}
+	if tag.RowsAffected() == 0 {
+		return ErrWalletNotFound
+	}
 
-	_, err = tx.Exec(ctx, `
+	tag, err = tx.Exec(ctx, `
 		UPDATE wallets
 		SET balance = balance + $1, updated_at = NOW()
 		WHERE id = $2
 	`, amount, toID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrWalletNotFound
+	}
 
-	return err
+	return nil
 }
 
 func scanWallet(row interface{ Scan(...any) error }) (*domain.Wallet, error) {
 	w := &domain.Wallet{}
 	err := row.Scan(&w.ID, &w.OwnerID, &w.Balance, &w.CreatedAt, &w.UpdatedAt)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrWalletNotFound
+		}
 		return nil, fmt.Errorf("scan wallet: %w", err)
 	}
 	return w, nil

@@ -151,6 +151,67 @@ func TestCreateTransferHandlerReturnsBadRequestForInsufficientFunds(t *testing.T
 	assertJSONError(t, rec, domain.ErrInsufficientFunds.Error())
 }
 
+func TestCreateTransferHandlerReturnsNotFoundForMissingWallet(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	fromID := uuid.New()
+	toID := uuid.New()
+	router := newTransferTestRouter(newTestTransferService(
+		&fakeTxManager{},
+		&fakeTransferRepo{},
+		&fakeWalletRepo{
+			wallets: map[uuid.UUID]*domain.Wallet{
+				fromID: {ID: fromID, Balance: decimal.NewFromInt(100)},
+			},
+		},
+		&fakeLedgerRepo{},
+	))
+
+	rec := performTransferRequest(router, transferRequestBody(map[string]string{
+		"idempotencyKey": "key-missing-wallet",
+		"fromWalletId":   fromID.String(),
+		"toWalletId":     toID.String(),
+		"amount":         "10",
+	}), "")
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected status 404, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	assertJSONError(t, rec, service.ErrWalletNotFound.Error())
+}
+
+func TestCreateTransferHandlerReturnsConflictForIdempotencyMismatch(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	fromID := uuid.New()
+	toID := uuid.New()
+	router := newTransferTestRouter(newTestTransferService(
+		&fakeTxManager{},
+		&fakeTransferRepo{
+			existing: &domain.Transfer{
+				ID:             uuid.New(),
+				IdempotencyKey: "repeat-key",
+				FromWalletID:   fromID,
+				ToWalletID:     toID,
+				Amount:         decimal.NewFromInt(10),
+				Status:         domain.StatusProcessed,
+			},
+		},
+		&fakeWalletRepo{},
+		&fakeLedgerRepo{},
+	))
+
+	rec := performTransferRequest(router, transferRequestBody(map[string]string{
+		"idempotencyKey": "repeat-key",
+		"fromWalletId":   fromID.String(),
+		"toWalletId":     toID.String(),
+		"amount":         "11",
+	}), "")
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected status 409, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	assertJSONError(t, rec, service.ErrIdempotencyConflict.Error())
+}
+
 func newTransferTestRouter(svc *service.TransferService) *gin.Engine {
 	router := gin.New()
 	handler.RegisterRoutes(router, handler.NewTransferHandler(svc))
