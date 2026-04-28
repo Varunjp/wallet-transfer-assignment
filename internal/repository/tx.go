@@ -21,10 +21,6 @@ func NewTxManager(db *pgxpool.Pool) *TxManager {
 	return &TxManager{db: db}
 }
 
-func NewTxManger(db *pgxpool.Pool) *TxManager {
-	return NewTxManager(db)
-}
-
 func (m *TxManager) WithTx(ctx context.Context, fn func(ctx context.Context) error) error {
 	tx, err := m.db.Begin(ctx)
 	if err != nil {
@@ -34,7 +30,7 @@ func (m *TxManager) WithTx(ctx context.Context, fn func(ctx context.Context) err
 	txCtx := context.WithValue(ctx, txKey{}, tx)
 
 	if err := fn(txCtx); err != nil {
-		_ = tx.Rollback(ctx)
+		_ = tx.Rollback(context.Background())
 		return err
 	}
 

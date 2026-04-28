@@ -393,6 +393,42 @@ func TestCreateTransferReturnsExistingTransferAfterUniqueViolation(t *testing.T)
 	}
 }
 
+func TestCreateTransferRejectsDifferentPayloadAfterUniqueViolation(t *testing.T) {
+	fromID := uuid.New()
+	toID := uuid.New()
+	existing := &domain.Transfer{
+		ID:             uuid.New(),
+		IdempotencyKey: "race-key",
+		FromWalletID:   fromID,
+		ToWalletID:     toID,
+		Amount:         decimal.NewFromInt(15),
+		Status:         domain.StatusProcessed,
+	}
+	transferRepo := &fakeTransferRepo{
+		createErr:              &pgconn.PgError{Code: "23505"},
+		existingAfterCreateErr: existing,
+	}
+	txManager := &fakeTxManager{}
+	svc := newTestTransferService(txManager, transferRepo, &fakeWalletRepo{}, &fakeLedgerRepo{})
+
+	resp, err := svc.CreateTransfer(context.Background(), service.CreateTransferRequest{
+		IdempotencyKey: "race-key",
+		FromWalletID:   fromID,
+		ToWalletID:     toID,
+		Amount:         decimal.NewFromInt(20),
+	})
+
+	if resp != nil {
+		t.Fatalf("expected nil response, got %#v", resp)
+	}
+	if !errors.Is(err, service.ErrIdempotencyConflict) {
+		t.Fatalf("expected idempotency conflict, got %v", err)
+	}
+	if txManager.calls != 0 {
+		t.Fatalf("conflicting unique fallback should skip tx, got %d", txManager.calls)
+	}
+}
+
 func TestCreateTransferConcurrentRequestsWithSameIdempotencyKey(t *testing.T) {
 	const requestCount = 20
 
@@ -540,7 +576,7 @@ func TestCreateTransferConcurrentDifferentTransfersDoNotOverspend(t *testing.T) 
 	}
 }
 
-func TestCreateTransferMarksFailedWhenLedgerInsertFails(t *testing.T) {
+func TestCreateTransferLeavesPendingWhenLedgerInsertFails(t *testing.T) {
 	fromID := uuid.New()
 	toID := uuid.New()
 	ledgerErr := errors.New("ledger insert failed")
@@ -568,9 +604,12 @@ func TestCreateTransferMarksFailedWhenLedgerInsertFails(t *testing.T) {
 	if !errors.Is(err, ledgerErr) {
 		t.Fatalf("expected ledger error, got %v", err)
 	}
-	if transferRepo.updateStatusCalls != 1 || transferRepo.updatedStatus != domain.StatusFailed {
-		t.Fatalf("expected failed status update, calls=%d status=%s",
+	if transferRepo.updateStatusCalls != 0 {
+		t.Fatalf("unexpected failed status update, calls=%d status=%s",
 			transferRepo.updateStatusCalls, transferRepo.updatedStatus)
+	}
+	if transferRepo.created == nil || transferRepo.created.Status != domain.StatusPending {
+		t.Fatalf("expected transfer to remain pending, got %#v", transferRepo.created)
 	}
 	if transferRepo.transitionCalls != 0 {
 		t.Fatalf("transition should not happen after ledger failure")
@@ -658,8 +697,24 @@ func (r *fakeTransferRepo) LockByID(_ context.Context, id uuid.UUID) (*domain.Tr
 	return nil, errors.New("transfer not found")
 }
 
-func (r *fakeTransferRepo) UpdateStatus(_ context.Context, _ uuid.UUID, status domain.TransferStatus, reason *string) error {
+func (r *fakeTransferRepo) UpdateStatus(_ context.Context, id uuid.UUID, status domain.TransferStatus, reason *string) error {
 	r.updateStatusCalls++
+	var tr *domain.Transfer
+	switch {
+	case r.created != nil && r.created.ID == id:
+		tr = r.created
+	case r.existing != nil && r.existing.ID == id:
+		tr = r.existing
+	case r.existingAfterCreateErr != nil && r.existingAfterCreateErr.ID == id:
+		tr = r.existingAfterCreateErr
+	}
+	if tr != nil {
+		if tr.Status != domain.StatusPending {
+			return domain.ErrInvalidTransition
+		}
+		tr.Status = status
+		tr.FailureReason = reason
+	}
 	r.updatedStatus = status
 	r.failureReason = reason
 	return r.updateStatusErr

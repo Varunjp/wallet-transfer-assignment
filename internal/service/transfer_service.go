@@ -138,6 +138,9 @@ func (s *TransferService) CreateTransfer(ctx context.Context, req CreateTransfer
 			if existing == nil {
 				return nil, fmt.Errorf("transfer already exists but could not be found")
 			}
+			if err := ensureIdempotentReplayMatches(existing, req); err != nil {
+				return nil, err
+			}
 			if existing.Status == domain.StatusPending {
 				return s.processPendingTransfer(ctx, existing, req, true)
 			}
@@ -256,13 +259,6 @@ func (s *TransferService) processPendingTransfer(
 		if errors.Is(err, repository.ErrWalletNotFound) {
 			err = ErrWalletNotFound
 		}
-		reason := err.Error()
-		_ = s.transferRepo.UpdateStatus(
-			ctx,
-			transfer.ID,
-			domain.StatusFailed,
-			&reason,
-		)
 		s.log.Error("transfer failed",
 			"transferID", transfer.ID,
 			"error", err,

@@ -10,8 +10,9 @@ import (
 )
 
 type Config struct {
-	DB   DBConfig
-	PORT string
+	DB       DBConfig
+	PORT     string
+	SeedData bool
 }
 
 type DBConfig struct {
@@ -52,7 +53,8 @@ func Load() (*Config, error) {
 			Name:     getEnv("DB_NAME", "wallet_service"),
 			SSLMode:  getEnv("DB_SSLMODE", "disable"),
 		},
-		PORT: getEnv("HTTP_PORT", "8080"),
+		PORT:     getEnv("HTTP_PORT", "8080"),
+		SeedData: getEnvBool("SEED_DATA", false),
 	}, nil
 }
 
@@ -61,4 +63,17 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
+	}
+
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
 }

@@ -41,26 +41,38 @@ func (r *TransferRepository) Create(ctx context.Context, t *domain.Transfer) err
 
 func (r *TransferRepository) UpdateStatus(ctx context.Context, id uuid.UUID, status domain.TransferStatus, reason *string) error {
 	if tx, err := getTx(ctx); err == nil {
-		_, err := tx.Exec(ctx, `
+		tag, err := tx.Exec(ctx, `
 			UPDATE transfers
 			SET status = $1,
 			    failure_reason = $2,
 			    updated_at = NOW()
-			WHERE id = $3
-		`, status, reason, id)
+			WHERE id = $3 AND status = $4
+		`, status, reason, id, domain.StatusPending)
 
-		return err
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return domain.ErrInvalidTransition
+		}
+		return nil
 	}
 
-	_, err := r.db.Exec(ctx, `
+	tag, err := r.db.Exec(ctx, `
 		UPDATE transfers
 		SET status = $1,
 		    failure_reason = $2,
 		    updated_at = NOW()
-		WHERE id = $3
-	`, status, reason, id)
+		WHERE id = $3 AND status = $4
+	`, status, reason, id, domain.StatusPending)
 
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return domain.ErrInvalidTransition
+	}
+	return nil
 }
 
 func (r *TransferRepository) LockByID(ctx context.Context, id uuid.UUID) (*domain.Transfer, error) {

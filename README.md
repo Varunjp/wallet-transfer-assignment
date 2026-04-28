@@ -4,9 +4,9 @@ Small Go/PostgreSQL service for wallet-to-wallet transfers with idempotent reque
 
 ## API
 
-### `POST /transfers`
+### `POST /api/transfers`
 
-`POST /transfers` is also kept as a compatibility alias.
+`POST /api/transfers` is the primary transfer endpoint. `POST /transfers` is also registered as a compatibility alias.
 
 ```json
 {
@@ -42,7 +42,7 @@ Each request is keyed by `idempotencyKey`. The service first checks for an exist
 - same key and different payload returns a conflict.
 - same key with a `PENDING` transfer locks the transfer row and either observes the settled state or resumes processing.
 
-The unique constraint on `transfers.idempotency_key` is the durable guard for concurrent duplicate requests. If two requests race past the pre-check, one insert wins and the other receives a unique-constraint error, reloads the existing transfer, and returns that result.
+The unique constraint on `transfers.idempotency_key` is the durable guard for concurrent duplicate requests. If two requests race past the pre-check, one insert wins and the other receives a unique-constraint error, reloads the existing transfer, verifies the payload matches, and returns that result.
 
 ## Transaction and Concurrency Handling
 
@@ -50,7 +50,7 @@ Transfer processing happens inside a database transaction after the transfer row
 
 Wallet locks are acquired in deterministic UUID order. This protects concurrent transfers touching the same pair of wallets from double spending while reducing deadlock risk. The debit, credit, ledger insert, and `PENDING -> PROCESSED` transition are committed together.
 
-For expected business failures such as insufficient funds or missing wallets, the transfer is marked `FAILED` with a reason. For unexpected failures during balance or ledger work, the transaction rolls back and the transfer is marked failed outside the rolled-back transaction.
+For expected business failures such as insufficient funds or missing wallets, the transfer is marked `FAILED` with a reason while the locked transfer is still `PENDING`. Unexpected processing failures roll back the transaction and leave the transfer `PENDING` so the same idempotency key can safely retry instead of clobbering a concurrently processed transfer.
 
 ## Failure and Retry Behavior
 
@@ -76,6 +76,8 @@ Create your local environment file from the example and set your own password:
 cp .env.example .env
 ```
 
+Optional local seed wallets are disabled by default. Set `SEED_DATA=true` only for local/dev databases when you want the sample wallets inserted at startup.
+
 Run the full service stack with PostgreSQL:
 
 ```sh
@@ -100,14 +102,14 @@ The tests cover:
 
 - request validation
 - numeric and string transfer amounts
-- `/transfers` routing
+- `/api/transfers` routing and the `/transfers` compatibility alias
 - idempotent replay behavior
 - idempotency payload conflicts
 - pending transfer retry/resume behavior
 - ledger debit/credit correctness
 - insufficient-funds and missing-wallet failures
 - concurrent duplicate requests with the same idempotency key
-- rollback/failure behavior when ledger insert fails
+- rollback/retry behavior when ledger insert fails
 
 ## AI Usage Note
 

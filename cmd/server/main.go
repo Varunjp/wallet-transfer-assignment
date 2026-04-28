@@ -22,15 +22,15 @@ func main() {
 
 	ctx := context.Background()
 
-	cfg,err := config.Load()
+	cfg, err := config.Load()
 
 	if err != nil {
-		log.Fatalf("failed to load env : %v",err)
+		log.Fatalf("failed to load env : %v", err)
 	}
 
-	db,err := db.NewPool(ctx,cfg.DB)
+	db, err := db.NewPool(ctx, cfg.DB)
 	if err != nil {
-		log.Fatalf("failed to connect db: %v",err)
+		log.Fatalf("failed to connect db: %v", err)
 	}
 	defer db.Close()
 
@@ -41,7 +41,7 @@ func main() {
 	walletRepo := repository.NewWalletRepository(db)
 	ledgerRepo := repository.NewLedgerRepository()
 
-	logg := slog.New(slog.NewJSONHandler(os.Stdout,nil))
+	logg := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 	transferService := service.NewTransferService(
 		txManager,
@@ -53,15 +53,17 @@ func main() {
 
 	transferHandler := handler.NewTransferHandler(transferService)
 
-	seedData(ctx,db)
+	if cfg.SeedData {
+		seedData(ctx, db)
+	}
 
 	r := gin.Default()
-	handler.RegisterRoutes(r,transferHandler)
+	handler.RegisterRoutes(r, transferHandler)
 
-	log.Printf("Server running on :%s\n",cfg.PORT)
+	log.Printf("Server running on :%s\n", cfg.PORT)
 
 	srv := &http.Server{
-		Addr: ":"+cfg.PORT,
+		Addr:    ":" + cfg.PORT,
 		Handler: r,
 	}
 
@@ -69,7 +71,6 @@ func main() {
 		log.Fatal(err)
 	}
 }
-
 
 func seedData(ctx context.Context, db *pgxpool.Pool) {
 	log.Println("Seeding data...")

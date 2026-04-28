@@ -28,17 +28,6 @@ type createTransferRequest struct {
 	Amount         json.RawMessage `json:"amount" binding:"required"`
 }
 
-type TransferResponse struct {
-	ID             string  `json:"id"`
-	IdempotencyKey string  `json:"idempotencyKey"`
-	FromWalletID   string  `json:"fromWalletId"`
-	ToWalletID     string  `json:"toWalletId"`
-	Amount         string  `json:"amount"`
-	Status         string  `json:"status"`
-	FailureReason  *string `json:"failureReason,omitempty"`
-	CreatedAt      string  `json:"createdAt"`
-}
-
 func (h *TransferHandler) CreateTransfer(c *gin.Context) {
 
 	var req createTransferRequest

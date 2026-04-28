@@ -139,6 +139,33 @@ func TestCreateTransferHandlerAcceptsNumericAmountOnSpecRoute(t *testing.T) {
 	))
 
 	body := `{"idempotencyKey":"numeric-amount","fromWalletId":"` + fromID.String() + `","toWalletId":"` + toID.String() + `","amount":10}`
+	req := httptest.NewRequest(http.MethodPost, "/api/transfers", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestCreateTransferHandlerKeepsCompatibilityAlias(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	fromID := uuid.New()
+	toID := uuid.New()
+	router := newTransferTestRouter(newTestTransferService(
+		&fakeTxManager{},
+		&fakeTransferRepo{},
+		&fakeWalletRepo{
+			wallets: map[uuid.UUID]*domain.Wallet{
+				fromID: {ID: fromID, Balance: decimal.NewFromInt(100)},
+				toID:   {ID: toID, Balance: decimal.NewFromInt(100)},
+			},
+		},
+		&fakeLedgerRepo{},
+	))
+
+	body := `{"idempotencyKey":"alias-route","fromWalletId":"` + fromID.String() + `","toWalletId":"` + toID.String() + `","amount":10}`
 	req := httptest.NewRequest(http.MethodPost, "/transfers", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
