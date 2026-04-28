@@ -68,6 +68,34 @@ Run:
 go test ./...
 ```
 
+## Docker
+
+Create your local environment file from the example and set your own password:
+
+```sh
+cp .env.example .env
+```
+
+Run the full service stack with PostgreSQL:
+
+```sh
+docker compose up -d --build
+```
+
+The API is available at `http://localhost:8080`, and PostgreSQL is exposed on `localhost:5432`.
+
+Stop the stack:
+
+```sh
+docker compose down
+```
+
+Remove the database volume too:
+
+```sh
+docker compose down -v
+```
+
 The tests cover:
 
 - request validation
@@ -83,11 +111,13 @@ The tests cover:
 
 ## AI Usage Note
 
-AI assistance used: ChatGPT,Claude chatbot.
+AI assistance used: ChatGPT,Claude chatbot and OpenAI codex in IDE.
 
 I used the tool to inspect the assignment, identify gaps, and make focused code/test/documentation changes. I reviewed the generated changes and verified them with `go test ./...`.
 
 Prompts used in this session:
 
 - `In production ready system were does idempotency key is stored? does it have separate table or it can be stored in transfer table only`
-- `give proper PR description`
+- `Give proper PR description`
+- `List any missing edge case`
+- `Write test case based on current transfer_service`
