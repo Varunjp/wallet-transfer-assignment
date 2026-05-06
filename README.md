@@ -123,3 +123,214 @@ Prompts used in this session:
 - `Give proper PR description`
 - `List any missing edge case`
 - `Write test case based on current transfer_service`
+
+## Tradeoffs / Assumptions
+
+### 1. Stored Balance vs Ledger-Derived Balance
+
+#### Decision
+
+Used stored balances in the `wallets` table while also maintaining immutable ledger entries.
+
+#### Why?
+
+- Balance checks become fast and efficient
+- Avoids recalculating balances from entire ledger history
+- Simplifies validation during concurrent transfers
+- Better operational performance under load
+
+#### Tradeoff
+
+Maintaining stored balances introduces synchronization complexity because both:
+
+- wallet balances
+- ledger entries
+
+must remain consistent.
+
+This was addressed by executing balance updates and ledger writes inside the same database transaction.
+
+#### Alternative Considered
+
+Deriving balances directly from the ledger.
+
+Pros:
+
+- simpler accounting source of truth
+- reduced risk of balance mismatch
+
+Cons:
+
+- expensive aggregation queries
+- slower reads under high transaction volume
+- more difficult concurrency validation
+
+---
+
+### 2. Pessimistic Locking vs Optimistic Locking
+
+#### Decision
+
+Used row-level pessimistic locking with:
+
+```sql
+SELECT ... FOR UPDATE
+```
+
+#### Why?
+
+- Guarantees serialized balance updates
+- Prevents overspending during concurrent debits
+- Easier reasoning about transactional correctness
+- Better fit for financial consistency requirements
+
+#### Tradeoff
+
+Pessimistic locking reduces parallelism because competing transactions must wait for locks.
+
+However, correctness and consistency were prioritized over maximum throughput.
+
+#### Alternative Considered
+
+Optimistic locking using version fields.
+
+Pros:
+
+- higher concurrency
+- reduced lock contention
+
+Cons:
+
+- retry complexity
+- more difficult conflict handling
+- greater risk of implementation bugs
+- less deterministic under heavy contention
+
+---
+
+### 3. Synchronous Workflow vs Async/Event-Driven Processing
+
+#### Decision
+
+Used synchronous transfer execution within a single database transaction.
+
+#### Why?
+
+- Strong transactional guarantees
+- Easier debugging and reasoning
+- Simpler implementation for exactly-once semantics
+- Reduced operational complexity
+
+#### Tradeoff
+
+This approach is less scalable than asynchronous processing because request latency depends on transaction completion.
+
+#### Alternative Considered
+
+Event-driven architecture using queues/outbox pattern.
+
+Pros:
+
+- improved scalability
+- better throughput
+- easier integration with distributed systems
+
+Cons:
+
+- eventual consistency complexity
+- harder idempotency coordination
+- increased operational overhead
+- more complex failure recovery
+
+---
+
+### 4. Database-Enforced Idempotency
+
+#### Decision
+
+Used database unique constraints on `transfers` table.
+
+#### Why?
+
+- Prevents duplicate transfer creation at persistence layer
+- Provides strong retry safety guarantees
+- Makes duplicate detection deterministic
+- Protects against race conditions during retries
+
+#### Tradeoff
+
+This approach introduces additional persistence and lookup overhead for each request.
+
+The additional complexity was considered acceptable because idempotency correctness is critical in payment-style systems.
+
+#### Alternative Considered
+
+In-memory caching or distributed cache-based idempotency.
+
+Pros:
+
+- lower latency
+- faster duplicate lookups
+
+Cons:
+
+- cache inconsistency risk
+- weaker durability guarantees
+- distributed invalidation complexity
+
+---
+
+### 5. Transaction Boundary Design
+
+#### Decision
+
+Wrapped the entire transfer workflow inside a single database transaction.
+
+#### Why?
+
+Ensures atomicity across:
+
+- balance updates
+- transfer creation
+- ledger writes
+- state transitions
+- idempotency handling
+
+#### Tradeoff
+
+Larger transactions hold locks longer and may increase contention under high throughput.
+
+This tradeoff was accepted to guarantee strong consistency.
+
+#### Alternative Considered
+
+Splitting operations into multiple smaller transactions.
+
+Pros:
+
+- shorter lock duration
+- potentially higher throughput
+
+Cons:
+
+- risk of partial failures
+- inconsistent ledger state
+- difficult rollback coordination
+
+---
+
+### 6. Ordered Wallet Locking
+
+#### Decision
+
+Wallet rows are always locked in deterministic order.
+
+#### Why?
+
+Prevents cyclic lock acquisition patterns and reduces deadlock probability during concurrent transfers.
+
+#### Tradeoff
+
+Adds small implementation complexity but significantly improves concurrency stability.
+
+---
